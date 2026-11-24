@@ -1,0 +1,41 @@
+<!doctype html><html><head><meta charset="utf-8">
+<style>body{margin:0;background:#fff;font-family:-apple-system,Helvetica,Arial,sans-serif}#c{padding:24px;display:inline-block}</style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script></head><body><div id="c"><pre class="mermaid">
+flowchart TB
+  classDef build fill:#FFF4E5,stroke:#E8710A,color:#202124
+  classDef uc fill:#E8F0FE,stroke:#1A73E8,color:#202124
+  classDef run fill:#E6F4EA,stroke:#188038,color:#202124
+  classDef user fill:#F1F3F4,stroke:#5F6368,color:#202124
+
+  subgraph B["① Build once, on a laptop or in CI"]
+    direction LR
+    D["Dockerfile<br/>ubuntu:24.04 · glibc 2.39 · Python 3.12<br/>scipy · statsmodels · pingouin · duckdb"]:::build
+    X["docker buildx build<br/>--platform linux/amd64<br/>--provenance=false --sbom=false"]:::build
+    D --> X
+  end
+
+  subgraph UC["② Unity Catalog"]
+    direction LR
+    AR[("Artifact Registry<br/>main.default.ab-stats-sandbox:v1")]:::uc
+    V[("Volume<br/>/Volumes/main/default/ab_data")]:::uc
+  end
+
+  subgraph R["③ Every request"]
+    direction LR
+    U(["Analyst / PM"]):::user
+    APP["Databricks App<br/><b>agent-bricks-ab-analyst</b><br/>LangGraph + run_python wrapper"]:::run
+    MCP["system.ai.sandbox MCP<br/>run_code(sandbox_id=ab-stats,<br/>language=sh)"]:::run
+    SB["Sandbox <b>ab-stats</b><br/>(from image@sha256)"]:::run
+    LLM["AI Gateway<br/>claude-sonnet-5-5"]:::run
+    U -- "Did the treatment win?" --> APP
+    APP <--> LLM
+    APP -- "run_python(code)" --> MCP
+    MCP --> SB
+  end
+
+  X -- "docker push" --> AR
+  AR -- "create_sandbox(image_uri)" --> SB
+  SB -- "reads CSV as the signed-in user" --> V
+</pre></div>
+<script>mermaid.initialize({startOnLoad:true,theme:'base',flowchart:{curve:'basis',htmlLabels:true,useMaxWidth:false,nodeSpacing:40,rankSpacing:60},themeVariables:{fontSize:'17px'}});</script>
+</body></html>

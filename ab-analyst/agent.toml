@@ -1,0 +1,20 @@
+schema_version = 1
+
+[agent]
+framework = "langgraph"
+server = "agentbricks"
+deployment_name = "ab-analyst"
+
+[memory_store]
+name = "ab-analyst-pzaugh-memory"
+
+[session_store]
+name = "ab-analyst-pzaugh-sessions"
+
+[tracing]
+experiment_name = "/Shared/agentbricks_traces/ab-analyst-pzaugh"
+[[tools]]
+id = "sandbox"
+auth = "user"
+source = {kind = "sandbox", service = "system.ai.sandbox"}
+policy = {databricks_access_token_included = true}

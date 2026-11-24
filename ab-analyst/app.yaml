@@ -1,0 +1,10 @@
+command: ["uv", "run", "start-server"]
+env:
+  # The custom-image sandbox the agent runs its analysis code in (see agent/custom_sandbox.py).
+  - name: AB_SANDBOX_ID
+    value: "ab-stats"
+# databricks apps listen by default on port 8000
+#
+# `agentbricks deploy` adds the runtime env it needs (tracing experiment, memory/session stores,
+# Runtime Store, package index) to this file when it deploys. Review the diff before committing
+# and keep only your own settings here.

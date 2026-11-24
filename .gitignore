@@ -1,0 +1,23 @@
+# --- Local-only: never commit ---
+# corporate proxy CA used as a build secret
+.local-ca/
+# browser profile used to record the demo (holds session cookies)
+.browser-profile/
+# internal notes
+findings/
+# raw, unredacted screenshots and recordings (blog/img holds the redacted copies)
+blog/assets/
+# evaluator scorecards
+blog/eval/
+
+# --- Generated ---
+# regenerate with scripts/seed_data.py (deterministic)
+data/
+sandbox-image/*.log
+.DS_Store
+__pycache__/
+*.pyc
+.env
+.venv/
+# resolved against a private mirror locally; readers resolve their own
+ab-analyst/uv.lock
