@@ -13,6 +13,7 @@
 - I built an `ubuntu:24.04` image (glibc 2.39, Python 3.12) with a pinned stats stack: scipy, statsmodels, pingouin and duckdb. I pushed it to Unity Catalog and created a sandbox from it.
 - I scaffolded the agent with the **[Agent Bricks CLI](https://docs.databricks.com/aws/en/agents/custom-agents/agent-bricks-cli)**, added the managed `system.ai.sandbox` tool, and pinned that tool to my sandbox with a small wrapper. Then I deployed it with `agentbricks deploy`.
 - A product manager asks "did the treatment win?" and gets a verdict in 20–40 seconds in my runs, computed with the same pinned library versions every time.
+- MLflow traces record every step, including the exact code sent to the sandbox. They showed that the sandbox took under 4 seconds and that a memory lookup was the real bottleneck.
 - On Apple silicon, **build for `linux/amd64`** (sandboxes are x86_64). I also turn off provenance attestations so the push is a plain single-platform manifest. That's the configuration I verified end to end.
 
 **Code:** everything here is in the companion repo, [`esiol-db/agentbricks-custom-sandbox`](https://github.com/esiol-db/agentbricks-custom-sandbox).
@@ -35,7 +36,7 @@ A custom image moves all three to build time. You build once, scan once and pin 
 
 ### Why it's worth it, and when it isn't
 
-For the business, the point is that an analyst's statistical playbook becomes something a PM can query in plain English, without waiting in the analyst's queue. As built here it's a single-owner pilot. See the production notes for what it takes to share it with a team. In my runs, question to verdict took **20 to 40 seconds**, including two or three sandbox executions and zero install time. Because sandbox code runs with the **signed-in user's** Unity Catalog permissions, reading data through the agent is governed by the same grants as reading it directly. Every tool call is traced. Security reviews one image instead of every ad-hoc `pip install`.
+For the business, the point is that an analyst's statistical playbook becomes something a PM can query in plain English, without waiting in the analyst's queue. As built here it's a single-owner pilot. See the production notes for what it takes to share it with a team. In my runs, question to verdict took **20 to 40 seconds**, including two or three sandbox executions and zero install time. Because sandbox code runs with the **signed-in user's** Unity Catalog permissions, reading data through the agent is governed by the same grants as reading it directly. Every tool call is traced in MLflow, down to the code that produced each number (see [Step 8](#step-8-read-the-trace-in-mlflow)). Security reviews one image instead of every ad-hoc `pip install`.
 
 The cost is that you now own an image pipeline: build, push, wait for acceleration, re-pin on upgrades. The docs also note that sandboxes from custom images can take longer to start than the default environment ([limitations](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image)). **Skip it** if the default image already covers your libraries, if the work is exploratory and one-off, or if your dependencies change faster than you'd rebuild an image.
 
@@ -342,6 +343,45 @@ Here is the hosted app while the agent was still streaming. The chat shows pingo
 
 ![Deployed agent mid-run: sandbox output in the chat, tool event in the Events panel](img/03-deployed-sandbox-output.png)
 
+## Step 8: Read the trace in MLflow
+
+You get tracing without writing any code for it. `agentbricks init` declared an experiment in `agent.toml` (`[tracing] experiment_name = "/Shared/agentbricks_traces/…"`), and `deploy` wired the app to it, so every invocation lands there as an MLflow trace ([MLflow tracing](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/overview)). You can check from the terminal:
+
+```console
+$ agentbricks -p my-ws tracing list
+TRACE ID                              STATUS   LATENCY (MS)   CREATED
+tr-40845e5c569e2cfac2ecff8e2c5bd2bd   ● Ok     33015          28 minutes ago
+tr-94d793876eb3860011e68728b8beac60   ● Ok     20435          28 minutes ago
+…
+$ agentbricks -p my-ws tracing get tr-40845e5c569e2cfac2ecff8e2c5bd2bd
+Status         OK
+Latency (ms)   33015
+Spans          19
+```
+
+The experiment's **Traces** tab shows every run's request, token count, latency and status. The list includes the three identical-prompt runs I compare in the next section, plus a few other questions:
+
+![MLflow Traces tab: one row per agent invocation, with tokens and execution time](img/07-mlflow-traces-list.png)
+
+Open one and the span tree shows how the 33 seconds were spent. Select the second `run_python` span: its input is the script the model wrote, and its output is exactly what the sandbox printed, pingouin's `T_test` table with `p_val 0.032388`, `CI95 [0.02, 0.54]` and `power 0.571`. Each number in the PM's answer traces back to the code that produced it:
+
+![Trace view: span tree on the left; the run_python span's code input and sandbox output on the right](img/08-mlflow-trace-run-python.png)
+
+The wrapper from Step 5 is visible in the tree as well. Every `run_python` span (the tool the model sees) has a child `run_code` span (the managed `system.ai.sandbox` call). The child's inputs are the audit evidence that the code ran where you intended: `sandbox_id: ab-stats`, `language: sh`, the base64-shipped script and `timeout_seconds: 120`. None of those values came from the model:
+
+![The nested run_code span: sandbox_id ab-stats and language sh, injected by the wrapper](img/09-mlflow-trace-run-code.png)
+
+Reading the timeline turned up something I wouldn't have guessed:
+
+| Step | Time |
+|---|---|
+| 3 model calls (4.8K, 6.7K, 9.1K tokens) | 2.5 s + 4.7 s + 6.3 s |
+| Sandbox execution: profiling, then the statistics | 1.6 s, 2.3 s |
+| `recall` (long-term memory lookup) | **13.4 s** |
+| Whole run | 33.0 s, 20.6K tokens |
+
+**The sandbox wasn't the slow part.** The two executions in my custom image took under 4 seconds combined. The slowest step was the template's memory `recall` tool. The model called it alongside the first `run_python`, and because the graph waits for both before the next model call, it held up the run for about 12 seconds, a third of the total. For a stateless analyst like this one, I'd try removing the memory binding next. Either way, the trace is where that kind of finding comes from: you see the actual cost of every step instead of guessing.
+
 ## What the agent concluded
 
 The deployed agent's numbers match `scripts/reference_analysis.py`, which I ran separately in the same image (the README has the one-line `docker run`):
@@ -427,10 +467,11 @@ The default sandbox is a fine general-purpose environment. Once an agent's answe
 14. AppKit Agents plugin. https://developers.databricks.com/docs/appkit/v0/plugins/agents
 15. Agentic features in Databricks Apps (Agents plugin vs. Agent Bricks CLI). https://developers.databricks.com/docs/apps/agentic-features
 16. databricks-ai-bridge PR #828, "Let sandbox tools select a Unity Catalog custom image" (draft). https://github.com/databricks/databricks-ai-bridge/pull/828
-17. Docker: multi-platform builds. https://docs.docker.com/build/building/multi-platform/
-18. Docker: build attestations. https://docs.docker.com/build/metadata/attestations/
-19. Docker: build secrets. https://docs.docker.com/build/building/secrets/
-20. Ubuntu 24.04 (noble) glibc source package (2.39). https://launchpad.net/ubuntu/noble/+source/glibc
-21. Ubuntu 24.04 (noble) python3.12 source package (3.12.3). https://launchpad.net/ubuntu/noble/+source/python3.12
-22. statsmodels `proportions_ztest`. https://www.statsmodels.org/stable/generated/statsmodels.stats.proportion.proportions_ztest.html
-23. pingouin `ttest`. https://pingouin-stats.org/generated/pingouin.ttest.html
+17. MLflow Tracing on Databricks. https://docs.databricks.com/aws/en/mlflow3/genai/tracing/overview
+18. Docker: multi-platform builds. https://docs.docker.com/build/building/multi-platform/
+19. Docker: build attestations. https://docs.docker.com/build/metadata/attestations/
+20. Docker: build secrets. https://docs.docker.com/build/building/secrets/
+21. Ubuntu 24.04 (noble) glibc source package (2.39). https://launchpad.net/ubuntu/noble/+source/glibc
+22. Ubuntu 24.04 (noble) python3.12 source package (3.12.3). https://launchpad.net/ubuntu/noble/+source/python3.12
+23. statsmodels `proportions_ztest`. https://www.statsmodels.org/stable/generated/statsmodels.stats.proportion.proportions_ztest.html
+24. pingouin `ttest`. https://pingouin-stats.org/generated/pingouin.ttest.html

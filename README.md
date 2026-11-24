@@ -69,6 +69,7 @@ cd ab-analyst
 cp .env.example .env && echo "DATABRICKS_CONFIG_PROFILE=$PROFILE" >> .env
 agentbricks -p $PROFILE dev          # http://localhost:8000
 agentbricks -p $PROFILE deploy       # -> agent-bricks-ab-analyst on Databricks Apps
+agentbricks -p $PROFILE tracing list # every invocation is an MLflow trace (tool calls, latency, tokens)
 ```
 
 To check the agent's numbers yourself, run the reference analysis in the same image:
