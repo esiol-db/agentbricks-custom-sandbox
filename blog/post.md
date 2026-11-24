@@ -1,100 +1,78 @@
 # Bring Your Own Runtime: Giving an Agent Bricks Agent a Custom Sandbox
 
-*How I built an A/B-test analyst agent that runs real statistics in a sandbox I control, using a Docker image built on my laptop, the Agent Bricks CLI, and about 50 lines of glue code.*
+*How I gave an Agent Bricks agent a sandbox with scipy, statsmodels and pingouin preinstalled, from a Docker image built on my laptop, and what its MLflow traces showed.*
 
 ![The deployed agent answering "Did the treatment win?" by running code in a custom sandbox](img/demo-deployed.gif)
-*The deployed agent at 2.5× speed. The full-length recording is [`img/demo-deployed.mp4`](img/demo-deployed.mp4) (55 s).*
+*The deployed agent at 2.5× speed. [Full recording (55 s, MP4)](img/demo-deployed.mp4).*
 
 ---
 
 ## TL;DR
 
-- **Databricks Sandbox** gives an agent an isolated microVM to run code in. When the default image doesn't have your toolchain, you can [start sandboxes from your own container image](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image) stored in [Artifact Registry](https://docs.databricks.com/aws/en/artifact-registry/).
-- I built an `ubuntu:24.04` image (glibc 2.39, Python 3.12) with a pinned stats stack: scipy, statsmodels, pingouin and duckdb. I pushed it to Unity Catalog and created a sandbox from it.
-- I scaffolded the agent with the **[Agent Bricks CLI](https://docs.databricks.com/aws/en/agents/custom-agents/agent-bricks-cli)**, added the managed `system.ai.sandbox` tool, and pinned that tool to my sandbox with a small wrapper. Then I deployed it with `agentbricks deploy`.
-- A product manager asks "did the treatment win?" and gets a verdict in 20–40 seconds in my runs, computed with the same pinned library versions every time.
-- MLflow traces record every step, including the exact code sent to the sandbox. They showed that the sandbox took under 4 seconds and that a memory lookup was the real bottleneck.
-- On Apple silicon, **build for `linux/amd64`** (sandboxes are x86_64). I also turn off provenance attestations so the push is a plain single-platform manifest. That's the configuration I verified end to end.
-
-**Code:** everything here is in the companion repo, [`esiol-db/agentbricks-custom-sandbox`](https://github.com/esiol-db/agentbricks-custom-sandbox).
+- Databricks Sandbox can start from [your own container image](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image). I built one on `ubuntu:24.04` (glibc 2.39, Python 3.12) with scipy, statsmodels, pingouin and duckdb preinstalled.
+- The [Agent Bricks CLI](https://docs.databricks.com/aws/en/agents/custom-agents/agent-bricks-cli) gave me an agent with a managed sandbox tool in two commands (`agentbricks init` and `agentbricks tools add sandbox`). Pointing that tool at my sandbox took a 78-line Python module, plus one line in `agent.py`, a system prompt and an environment variable.
+- In the MLflow traces, the four deployed analyses in this post took 20–33 seconds each, and their numbers matched a reference analysis I ran separately.
+- On Apple silicon, **build for `linux/amd64`**. Every sandbox I ran reported x86_64 (the docs don't state the architecture), so an arm64 image is the wrong build for it.
+- Code: [github.com/esiol-db/agentbricks-custom-sandbox](https://github.com/esiol-db/agentbricks-custom-sandbox)
 
 ---
 
-## The problem: "just pip install it" doesn't scale
+## Why not just `pip install` at runtime?
 
-A product team runs an experiment and asks: *did the new checkout button win?* Answering properly takes a short, specific playbook. You need a sample-ratio-mismatch (SRM) check, a two-proportion z-test ([statsmodels](https://www.statsmodels.org/stable/generated/statsmodels.stats.proportion.proportions_ztest.html)), a Welch t-test on revenue with effect size and power ([pingouin](https://pingouin-stats.org/generated/pingouin.ttest.html)), and an honest caveat or two.
+A product team asks: *did the new checkout button win?* A proper answer needs a sample-ratio check, a two-proportion z-test ([statsmodels](https://www.statsmodels.org/stable/generated/statsmodels.stats.proportion.proportions_ztest.html)), a Welch t-test on revenue ([pingouin](https://pingouin-stats.org/generated/pingouin.ttest.html)), a power calculation, and a plain statement of what the data can't tell you.
 
-An LLM is good at writing that analysis and bad at running it in its head, so you give it a code-execution tool. Databricks Sandbox is built for this: an isolated, serverless microVM with a persistent home directory, reachable through the API, the SDK, the CLI, or as a managed tool for agents ([docs](https://docs.databricks.com/aws/en/compute/serverless/sandbox)).
+An LLM can write that code but can't reliably run it in its head. [Databricks Sandbox](https://docs.databricks.com/aws/en/compute/serverless/sandbox) gives it an isolated environment on serverless compute to run code in. In my run of a default-image sandbox, pandas and scipy imported fine, but statsmodels, pingouin and duckdb raised `ModuleNotFoundError`.
 
-When I checked the default sandbox image, it had pandas and scipy. **statsmodels, pingouin and duckdb were not installed.** The obvious fix is to have the agent `pip install` them at the start of every run. I didn't want that, for three reasons:
+Installing them on every run has three costs. The user waits on pip before any analysis starts. The answer drifts as library versions move. And every run re-trusts the package index. A custom image does that work at build time instead: you build once, review once, pin by digest, and use Unity Catalog grants to control who can use the image.
 
-1. **Latency.** Every fresh sandbox waits on a dependency install before the analysis starts, and the user is the one waiting.
-2. **Reproducibility.** "Latest pingouin" today is not latest pingouin next quarter. When the question is *should we ship?*, I want the p-value to come from a known library version.
-3. **Egress and supply chain.** Runtime installs need package-index access from the sandbox, and you re-trust the supply chain on every run instead of once.
+For a team, the PM gets a first read on an experiment without waiting for an analyst, and the analyst reviews a trace instead of redoing the work. Security also has one image to review instead of every runtime install. I didn't benchmark runtime installs, so I can't quantify the saving. In a full analysis, the sandbox calls themselves took 3.9 seconds.
 
-A custom image moves all three to build time. You build once, scan once and pin by digest. Every sandbox starts from the same environment, and the image is a Unity Catalog object with its own grants.
-
-### Why it's worth it, and when it isn't
-
-For the business, the point is that an analyst's statistical playbook becomes something a PM can query in plain English, without waiting in the analyst's queue. As built here it's a single-owner pilot. See the production notes for what it takes to share it with a team. In my runs, question to verdict took **20 to 40 seconds**, including two or three sandbox executions and zero install time. Because sandbox code runs with the **signed-in user's** Unity Catalog permissions, reading data through the agent is governed by the same grants as reading it directly. Every tool call is traced in MLflow, down to the code that produced each number (see [Step 8](#step-8-read-the-trace-in-mlflow)). Security reviews one image instead of every ad-hoc `pip install`.
-
-The cost is that you now own an image pipeline: build, push, wait for acceleration, re-pin on upgrades. The docs also note that sandboxes from custom images can take longer to start than the default environment ([limitations](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image)). **Skip it** if the default image already covers your libraries, if the work is exploratory and one-off, or if your dependencies change faster than you'd rebuild an image.
-
----
+Skip all this if the default image already has your libraries, if the work is one-off, or if your dependencies change faster than you'd rebuild. You also take on an image build to maintain, and the docs note that "sandboxes created from a custom image can take longer to start than sandboxes that use the default environment."
 
 ## What we're building
 
 ![Architecture: build the image once, push it to Unity Catalog, create a sandbox from it, and point the agent's sandbox tool at that sandbox](img/00-architecture.png)
+*How the pieces connect: the image is built once, stored in Unity Catalog, and used by every request.*
 
-Three phases:
+- **① Build once:** cross-build the image for `linux/amd64` on your laptop.
+- **② Store in Unity Catalog:** push it to [Artifact Registry](https://docs.databricks.com/aws/en/artifact-registry/) as `main.default.ab-stats-sandbox:v1`, then create the sandbox `ab-stats` from its digest. The experiment data sits in a volume in the same schema.
+- **③ Every request:** the model writes Python, and a small wrapper sends it to the managed `system.ai.sandbox` tool with `sandbox_id="ab-stats"`. The code runs in my image and reads the volume with the signed-in user's permissions.
 
-1. **Build once.** A Dockerfile on `ubuntu:24.04`, cross-built for `linux/amd64` and pushed to Artifact Registry as `main.default.ab-stats-sandbox:v1`.
-2. **Create the sandbox.** One SDK call with `image_uri` set to the image digest gives a sandbox named `ab-stats`.
-3. **Every request.** The agent, hosted on Databricks Apps, calls the managed `system.ai.sandbox` MCP tool with `sandbox_id="ab-stats"`. The code runs inside my image and reads the experiment from a Unity Catalog volume.
+You'll need:
+- a workspace with the Databricks Sandbox (Beta) and Artifact Registry (Public Preview) [previews enabled](https://docs.databricks.com/aws/en/admin/workspace-settings/manage-previews)
+- the Databricks CLI ≥ 1.18 with an OAuth profile
+- Docker with `buildx`, plus `uv` (and `jq` if you run the Step 2 commands by hand)
+- `USE CATALOG` on the catalog, and `USE SCHEMA`, `CREATE VOLUME` and `READ VOLUME` on the schema, that will hold the image and the data (`main.default` here)
 
-**Prerequisites:**
-- A workspace with the **Databricks Sandbox** (Beta) and **Artifact Registry** (Public Preview) previews enabled ([manage previews](https://docs.databricks.com/aws/en/admin/workspace-settings/manage-previews)).
-- The Databricks CLI ≥ 1.18 with an OAuth profile. I used CLI 1.26.0 and the `agentbricks` CLI 0.10.0. The project's runtime library (`databricks-agentbricks[langgraph]>=0.10.0`) resolved to 0.11.0.
-- Docker with `buildx`, plus `uv` and `jq`.
-- `USE CATALOG`, `USE SCHEMA`, `CREATE VOLUME` and `READ VOLUME` on the target schema ([Artifact Registry permissions](https://docs.databricks.com/aws/en/artifact-registry/get-started)).
-
-**Repo setup.** The helper scripts use the agent project's Python environment and read your profile from the environment:
+I used Databricks CLI 1.26.0 and the `agentbricks` CLI 0.10.0. The project's runtime library resolved to 0.11.0.
 
 ```bash
 git clone https://github.com/esiol-db/agentbricks-custom-sandbox.git && cd agentbricks-custom-sandbox
-(cd ab-analyst && uv sync)                 # installs databricks-sdk, pandas, … for the scripts too
+(cd ab-analyst && uv sync)                         # one environment for the agent and the helper scripts
 export PROFILE=my-ws DATABRICKS_CONFIG_PROFILE=my-ws
 ```
 
-In the steps below, `python scripts/…` means `uv run --project ab-analyst python scripts/…`.
+In the steps below, `python scripts/…` is short for `uv run --project ab-analyst python scripts/…`.
 
----
+## A two-minute tour of the Agent Bricks CLI
 
-## Agent Bricks CLI in two minutes
-
-The [Agent Bricks CLI](https://docs.databricks.com/aws/en/agents/custom-agents/agent-bricks-cli) (`agentbricks`) is the code-first way to build agents on Databricks. You write the agent logic, in LangGraph or the OpenAI Agents SDK. The CLI handles the platform side: model access through AI Gateway, tools, memory and session stores, tracing, and deployment to Databricks Apps. The command set is small:
+`agentbricks` is a CLI for building agents in code on Databricks. You write the agent in [LangGraph](https://langchain-ai.github.io/langgraph/) or the OpenAI Agents SDK. The CLI handles model access through [AI Gateway](https://docs.databricks.com/aws/en/ai-gateway/) (the default model is `system.ai.claude-sonnet-5-5`, with no keys to manage), tools, memory and session stores, MLflow tracing, and deployment to Databricks Apps.
 
 ```bash
 uv tool install databricks-agentbricks
-
-agentbricks init my-agent          # scaffold a LangGraph (default) or OpenAI Agents SDK project
+agentbricks init my-agent          # scaffold a project (LangGraph by default)
 agentbricks tools add sandbox      # give it a managed code-execution tool
-agentbricks dev                    # run locally with a chat UI on :8000
+agentbricks dev                    # chat with it locally on :8000
 agentbricks deploy                 # ship it to Databricks Apps
 ```
 
-Tools, stores and tracing are declared in an `agent.toml` manifest, and `deploy` reconciles them. It creates the stores, grants the app access and wires up tracing. The scaffold's default model is `system.ai.claude-sonnet-5-5`, served through AI Gateway, so there are no keys to manage. The docs label the CLI Beta, and its own `--help` calls it experimental, with preview APIs that may change. Check `agentbricks <command> --help` after upgrades ([command reference](https://github.com/databricks/databricks-ai-bridge/blob/main/integrations/agentbricks/cli.md)).
+Tools, stores and tracing live in an `agent.toml` manifest, and `deploy` creates whatever it declares. The docs list the CLI as Beta and its `--help` calls it experimental, so recheck `--help` after upgrades ([command reference](https://github.com/databricks/databricks-ai-bridge/blob/main/integrations/agentbricks/cli.md)). Out of the box, `tools add sandbox` uses the default image. The rest of this post points it at yours.
 
-Out of the box, `agentbricks tools add sandbox` gives the agent sandboxes from the **default** image. The rest of this post points that tool at **your** image.
+## Step 1: Build the image
 
----
-
-## Step 1: Build the image and check it locally
-
-The [custom-image requirements](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image) are short: glibc 2.25 or newer, and no musl-based images such as Alpine. `ubuntu:24.04` ships glibc 2.39 and Python 3.12 as system packages ([glibc](https://launchpad.net/ubuntu/noble/+source/glibc), [python3.12](https://launchpad.net/ubuntu/noble/+source/python3.12)), so there's no need for a third-party Python base. Abridged, the Dockerfile looks like this (the repo version adds optional proxy support):
+The requirements for a custom image are short: glibc 2.25 or newer, and no musl-based images such as Alpine. Ubuntu 24.04 ships glibc 2.39 and Python 3.12 as system packages, so you don't need a separate Python base image. Here's the Dockerfile, abridged. The [full version](https://github.com/esiol-db/agentbricks-custom-sandbox/blob/main/sandbox-image/Dockerfile) adds the proxy secret, the mirror argument and a pip upgrade:
 
 ```dockerfile
-# syntax=docker/dockerfile:1
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1 MPLBACKEND=Agg
 
@@ -102,29 +80,25 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 python3-venv python3-pip ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
-# The stats stack lives in a venv that is first on PATH, so `python3` means our Python.
-ARG PIP_INDEX_URL=https://pypi.org/simple
+# A venv first on PATH, so `python3` in the sandbox means this Python.
 COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m venv /opt/venv \
- && /opt/venv/bin/pip install --upgrade pip \
- && /opt/venv/bin/pip install -r /tmp/requirements.txt
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install -r /tmp/requirements.txt
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # Fail the build, not the agent, if something is missing.
 RUN python3 -c "import scipy, statsmodels, pingouin, duckdb, pandas, matplotlib"
 ```
 
-`requirements.txt` pins the eight direct dependencies: pandas 3.1.1, pyarrow 26.0.1, numpy 2.5.5, scipy 1.18.1, statsmodels 0.15.0, pingouin 0.7.0, duckdb 1.5.6 and matplotlib 3.11.2. Their transitive dependencies (scikit-learn, xarray and so on) resolve at build time, so two builds a month apart can differ. What freezes the full environment is the **image digest**. For a rebuildable record, the repo also ships `requirements.lock.txt`, the `pip freeze` of the image I pushed, with 31 packages.
+`requirements.txt` pins the eight direct dependencies: scipy 1.18.1, statsmodels 0.15.0, pingouin 0.7.0, duckdb 1.5.6, pandas 3.1.1 and three more. Transitive dependencies resolve at build time, so the digest is what freezes the full environment. `requirements.lock.txt` records a `pip freeze` of the image I pushed.
 
-### The Apple silicon gotcha
+> **On Apple silicon.** When my deployed agent ran `platform.platform()` inside a sandbox, it reported `Linux-6.18.60-x86_64-with-glibc2.39`. Build on an M-series Mac without `--platform linux/amd64` and you push an arm64 image, the wrong architecture for that host.
+>
+> I also pass `--provenance=false --sbom=false`. By default `buildx` attaches a [provenance attestation](https://docs.docker.com/build/metadata/attestations/), which turns the push into a manifest index with an extra `unknown/unknown` entry. Without it, the registry receives a plain single-platform manifest. Step 2 shows how to check.
 
-**Sandboxes run on `linux/amd64`.** In my sandbox, `platform.platform()` reported `Linux-6.18.60-x86_64-with-glibc2.39` (you'll see it in the Step 7 output too). Build on an M-series Mac without saying so and you get an arm64 image, which an x86_64 microVM can't run. The second thing to know is less obvious. `docker buildx` attaches a [provenance attestation](https://docs.docker.com/build/metadata/attestations/) by default, which turns the push into a manifest *index* with an extra `unknown/unknown` platform entry next to your image. If a sandbox fails to start from an image you pushed off a Mac, an unexpected index is one of the first things to rule out. I sidestep it with `--provenance=false --sbom=false`, so the registry receives a plain single-platform manifest ([multi-platform builds](https://docs.docker.com/build/building/multi-platform/)). That's the setup I verified end to end.
-
-Build a local copy first and check it. **Do this before pushing**, because Artifact Registry doesn't serve blobs back to Docker clients, so you can't inspect the pushed image afterwards ([limitations](https://docs.databricks.com/aws/en/artifact-registry/)):
+Build a local copy and check it before you push. After pushing, you can still read the manifest with `docker buildx imagetools inspect`, but you can't pull the image back out of Artifact Registry to run it ([limitations](https://docs.databricks.com/aws/en/artifact-registry/)):
 
 ```console
-$ docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
-    -t ab-stats-sandbox:v1 --load sandbox-image/
+$ docker buildx build --platform linux/amd64 --provenance=false --sbom=false -t ab-stats-sandbox:v1 --load sandbox-image/
 $ docker image inspect ab-stats-sandbox:v1 --format '{{.Os}}/{{.Architecture}}'
 linux/amd64
 $ docker run --rm --platform linux/amd64 ab-stats-sandbox:v1 bash -c 'ldd --version | head -1; python3 --version'
@@ -132,66 +106,64 @@ ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39
 Python 3.12.3
 ```
 
-On an M-series Mac the amd64 build runs under emulation. The `pip install` layer took about two minutes, and later builds come from cache. The result is about 300 MB compressed as pushed (five layers) and 1.3 GB unpacked.
+Under emulation on my Mac, with packages coming through a corporate mirror, the `pip install` layer took about two minutes. The five pushed layers total 298.6 MB compressed.
 
-> **Building behind a corporate proxy?** My first build failed with `CERTIFICATE_VERIFY_FAILED`, because the network inspects TLS. The repo's Dockerfile optionally accepts the proxy CA as a [BuildKit secret](https://docs.docker.com/build/building/secrets/) (`--secret id=extra_ca,src=ca.pem`) and a package mirror via `--build-arg PIP_INDEX_URL=…`. A secret is mounted only for that one `RUN` step, so the CA never lands in a layer.
-
-## Step 2: Push to Artifact Registry
-
-Artifact Registry stores container images as Unity Catalog objects named `catalog.schema.artifact`. Docker authenticates through a credential helper that the Databricks CLI installs ([get started](https://docs.databricks.com/aws/en/artifact-registry/get-started)):
+My first build failed with `CERTIFICATE_VERIFY_FAILED`, because the corporate network inspects TLS. The repo's Dockerfile takes the proxy CA as a [build secret](https://docs.docker.com/build/building/secrets/), which never lands in the image, and an optional package mirror:
 
 ```bash
-# `databricks auth docker` is marked (Experimental) in CLI 1.26's help.
-databricks auth docker configure --profile my-ws      # one-time: installs the credential helper
+EXTRA_BUILD_ARGS="--secret id=extra_ca,src=$PWD/ca.pem --build-arg PIP_INDEX_URL=https://mirror.example.com/simple" \
+  ./sandbox-image/build_and_push.sh v1
+```
+
+Build args are recorded in the image history, so only pass ones you don't mind people seeing.
+
+## Step 2: Push it to Artifact Registry
+
+Artifact Registry stores images as Unity Catalog objects named `catalog.schema.artifact`. The Databricks CLI installs a Docker credential helper for you ([get started](https://docs.databricks.com/aws/en/artifact-registry/get-started)):
+
+```bash
+databricks auth docker configure --profile my-ws          # one-time (marked Experimental in CLI 1.26)
 REGISTRY=$(databricks auth docker host --profile my-ws -o json | jq -r .host)
-# -> <workspace-id>.container.<region>.cloud.databricks.com
 
 docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
   -t "$REGISTRY/main.default.ab-stats-sandbox:v1" --push sandbox-image/
 ```
 
-This is the same build as Step 1 with a different tag and `--push`, so every layer comes from cache and only the upload takes time. In the repo, `PROFILE=my-ws ./sandbox-image/build_and_push.sh v1` runs these three commands for you. Set `ARTIFACT=catalog.schema.name` to push somewhere other than `main.default`. The workspace OAuth token Docker uses expires after an hour. If a big push fails authorization partway through, run it again so the helper fetches a fresh token ([Artifact Registry](https://docs.databricks.com/aws/en/artifact-registry/)). For other auth or push errors, see the [troubleshooting guide](https://docs.databricks.com/aws/en/artifact-registry/troubleshooting).
-
-The image can't be used as soon as the push finishes. Databricks first *accelerates* it, and you wait for `image_acceleration_details.status` to read `SUCCESS`. The same response gives you the digest you'll pin in the next step:
+It's the same build as before, so every layer comes from cache and only the upload takes time. `./sandbox-image/build_and_push.sh v1` wraps all three commands, then prints `imagetools inspect` so you can confirm the push is a single manifest rather than an index:
 
 ```console
-$ databricks api get --profile my-ws \
-    "/api/2.1/unity-catalog/software-artifacts/main.default.ab-stats-sandbox/versions"
-{
-  "software_artifact_versions": [{
-    "digest": "sha256:1c1464abc8866b98db0e3984e4b4082c35bba6896c9d706313e300e5b1fbcd51",
-    "tags": ["v1"],
-    "image_acceleration_details": { "status": "SUCCESS" }
-  }]
-}
+$ docker buildx imagetools inspect "$REGISTRY/main.default.ab-stats-sandbox:v1"
+Name:      $REGISTRY/main.default.ab-stats-sandbox:v1
+MediaType: application/vnd.oci.image.manifest.v1+json
+Digest:    sha256:1c1464abc8866b98db0e3984e4b4082c35bba6896c9d706313e300e5b1fbcd51
 ```
 
-The docs say acceleration can take 15 minutes or more. My 300 MB image was ready in about a minute. `PROFILE=my-ws scripts/wait_for_acceleration.sh main.default.ab-stats-sandbox v1` polls until it's done and prints the digest.
+A pushed image can't be used until Databricks has accelerated it. The docs warn that this can take 15 minutes or more. Mine already read `SUCCESS` on my first poll, 48 seconds after the version appeared. `scripts/wait_for_acceleration.sh` does the polling and prints the digest you'll pin next:
+
+```console
+$ PROFILE=my-ws scripts/wait_for_acceleration.sh main.default.ab-stats-sandbox v1
+15:17:08 +0m  SUCCESS sha256:1c1464abc8866b98db0e3984e4b4082c35bba6896c9d706313e300e5b1fbcd51
+```
 
 ## Step 3: Create the sandbox and load the data
 
-One SDK call. I pin by **digest** rather than tag, because a tag can be moved to another image and a digest can't:
+Pin by digest. A tag can be moved to another image; a digest can't:
 
 ```python
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sandbox import EnvironmentSpec, Sandbox, SandboxSpec
 
-w = WorkspaceClient()
-sb = w.sandbox.create_sandbox(
-    sandbox=Sandbox(
-        display_name="A/B test analyst (stats stack)",
-        spec=SandboxSpec(environment=EnvironmentSpec(
-            image_uri="main.default.ab-stats-sandbox@sha256:<digest>")),  # digest from Step 2
-    ),
+WorkspaceClient().sandbox.create_sandbox(
+    sandbox=Sandbox(spec=SandboxSpec(environment=EnvironmentSpec(
+        image_uri="main.default.ab-stats-sandbox@sha256:<digest>"))),
     sandbox_id="ab-stats",
 )
 ```
 
-`scripts/create_sandbox.py` waits for `SANDBOX_STATE_RUNNING` and runs a smoke test with `execute_command_sync` ([SDK usage](https://docs.databricks.com/aws/en/compute/serverless/sandbox-quickstart)):
+`scripts/create_sandbox.py` does this, waits for the sandbox to start, and runs a smoke test with `execute_command_sync` ([quickstart](https://docs.databricks.com/aws/en/compute/serverless/sandbox-quickstart)):
 
 ```console
-$ python scripts/create_sandbox.py ab-stats "main.default.ab-stats-sandbox@sha256:<digest>"   # output trimmed
-created sandboxes/ab-stats
+$ python scripts/create_sandbox.py ab-stats "main.default.ab-stats-sandbox@sha256:<digest>"     # trimmed
 running after 29s
 PRETTY_NAME="Ubuntu 24.04.5 LTS"
 ldd (Ubuntu GLIBC 2.39-0ubuntu8.9) 2.39
@@ -199,7 +171,7 @@ Python 3.12.3
 scipy 1.18.1 | statsmodels 0.15.0 | pingouin 0.7.0 | duckdb 1.5.6
 ```
 
-Next, the data. `scripts/seed_data.py` generates a synthetic checkout-button experiment with a fixed seed: 50,000 visitors with variant, device, a conversion flag and revenue. Everyone who runs it gets the same CSV. I put it in a Unity Catalog volume, which the sandbox mounts under `/Volumes` and reads with the caller's permissions ([volumes](https://docs.databricks.com/aws/en/volumes/)):
+The data is a synthetic checkout-button experiment, generated with a fixed seed so you get the same 50,000 rows I did. It goes in a [Unity Catalog volume](https://docs.databricks.com/aws/en/volumes/), which the sandbox mounts under `/Volumes`:
 
 ```bash
 python scripts/seed_data.py data/checkout_button_test.csv
@@ -207,271 +179,187 @@ databricks volumes create main default ab_data MANAGED --profile my-ws
 databricks fs cp data/checkout_button_test.csv dbfs:/Volumes/main/default/ab_data/ --profile my-ws
 ```
 
-## Step 4: Scaffold the agent and add the sandbox tool
+## Step 4: Scaffold the agent
+
+If you cloned the repo, `ab-analyst/` is already scaffolded and the binding below is already in place, so skip the two commands. Starting from scratch, run this in a directory where `ab-analyst` doesn't exist yet:
 
 ```bash
-agentbricks -p my-ws init --name ab-analyst ab-analyst
-cd ab-analyst
+agentbricks -p my-ws init --name ab-analyst ab-analyst && cd ab-analyst
 agentbricks tools add sandbox
 ```
 
-The last command adds one binding to `agent.toml`:
+The second command adds one binding to `agent.toml`:
 
 ```toml
 [[tools]]
 id = "sandbox"
-auth = "user"                                         # code runs as the signed-in user
+auth = "user"                                          # code runs as the signed-in user
 source = {kind = "sandbox", service = "system.ai.sandbox"}
 policy = {databricks_access_token_included = true}
 ```
 
-`system.ai.sandbox` is a Databricks-managed MCP service ([built-in MCP services](https://docs.databricks.com/aws/en/agents/mcp-tools/built-in-mcp-services)) with three tools: `create_sandbox`, `run_code` and `delete_sandbox`. This post depends on one detail of `run_code`: its **`sandbox_id`** argument. The tool's own schema describes it as "an owned sandbox from create_sandbox, an earlier run_code call, **or the Sandbox API**". That means the managed tool can target a sandbox you built yourself. `scripts/sandbox_mcp.py list` prints the full schema if you want to see it.
+[`system.ai.sandbox`](https://docs.databricks.com/aws/en/agents/mcp-tools/built-in-mcp-services) is a Databricks-managed MCP service with three tools: `create_sandbox`, `run_code` and `delete_sandbox`. This whole setup relies on `run_code`'s `sandbox_id` argument. The tool's schema (`python scripts/sandbox_mcp.py list` prints it) describes it as "an owned sandbox from create_sandbox, an earlier run_code call, or the Sandbox API". So the managed tool can run code in the sandbox from Step 3.
 
 ## Step 5: Pin the tool to your sandbox
 
-Left alone, the model decides whether to create a sandbox and which one to use. I want the opposite: the model writes Python, and the **server** decides where it runs. `agent/custom_sandbox.py` hides `create_sandbox` and `delete_sandbox`, and replaces `run_code` with a `run_python(code)` tool that always targets `$AB_SANDBOX_ID`:
+Left alone, the model decides which sandbox to use, and can create new ones from the default image. I wanted the server to choose where code runs. `agent/custom_sandbox.py` hides `create_sandbox` and `delete_sandbox`, and wraps `run_code` in a `run_python(code)` tool that always targets `$AB_SANDBOX_ID`. Condensed from the repo:
 
 ```python
-def _shell_for(code: str) -> str:
-    # base64 so quotes, heredocs and backslashes in the model's code survive the shell
-    payload = base64.b64encode(code.encode()).decode()
-    return f"cd /tmp && echo {payload} | base64 -d > cell.py && python3 cell.py"
-
-
 def _pinned_run_python(run_code: BaseTool, sandbox_id: str) -> BaseTool:
     async def run_python(code: str, timeout_seconds: int = 120):
+        script = base64.b64encode(code.encode()).decode()      # survives any quoting in the code
         return await run_code.ainvoke({
-            "sandbox_id": sandbox_id,      # chosen by the server, never by the model
+            "sandbox_id": sandbox_id,                           # set by the server, never by the model
             "language": "sh",
-            "code": _shell_for(code),
+            "code": f"cd /tmp && echo {script} | base64 -d > cell.py && python3 cell.py",
             "timeout_seconds": timeout_seconds,
         })
 
     return StructuredTool.from_function(
         coroutine=run_python, name="run_python", args_schema=RunPythonArgs,
-        description="Run a Python script in the team's statistics sandbox. Python 3.12 with "
-                    "pinned packages: pandas 3.1, numpy 2.5, scipy 1.18, statsmodels 0.15, "
-                    "pingouin 0.7, duckdb 1.5, matplotlib 3.11. These are newer than many "
-                    "examples you know: print a result's columns before indexing into it …",
-    )
+        description="Run a Python script in the team's statistics sandbox. Python 3.12 with pinned "
+                    "packages: pandas 3.1, scipy 1.18, statsmodels 0.15, pingouin 0.7, duckdb 1.5 … "
+                    "Print a result's columns before indexing into it (pingouin uses snake_case, "
+                    "e.g. 'cohen_d').")
 ```
 
-Wiring it in takes an import and one call in `agent/agent.py`, right after the template loads its MCP tools. The analyst system prompt goes in the same file:
+Beyond the template, the agent needs three changes:
 
-```python
-mcp = await mcp_tools(build_mcp_servers(), workspace_client_for=workspace_client_for)
-mcp = pin_to_custom_sandbox(mcp)
-```
+- one call in `agent/agent.py`, `mcp = pin_to_custom_sandbox(mcp)`, right after the template loads its MCP tools
+- an analyst system prompt in the same file
+- the sandbox ID in `app.yaml`:
 
-The sandbox ID lives in `app.yaml`. `agentbricks dev` and the deployed app both read their environment from that file, so one setting covers both:
+  ```yaml
+  env:
+    - name: AB_SANDBOX_ID
+      value: "ab-stats"
+  ```
 
-```yaml
-command: ["uv", "run", "start-server"]
-env:
-  - name: AB_SANDBOX_ID
-    value: "ab-stats"
-```
+`agentbricks dev` generates its local config from `app.yaml`, so that setting covers local runs and the deployed app. A unit test checks that the model only ever sees `run_python(code, timeout_seconds)`.
 
-Some of this isn't obvious from the code.
+Three details that matter:
 
-**Calls still go through the managed tool.** I wrap the `run_code` tool object the CLI already built, so its identity handling, auth mode and `agent.toml` policy all still apply. The wrapper only fixes *which* sandbox the code runs in and *how* it's started.
+- **Wrap the managed tool.** The wrapper calls the `run_code` tool object the CLI built, so identity, auth mode and the `agent.toml` policy still apply.
+- **Use shell mode.** On my custom image, `run_code`'s stateful `language: "python"` mode failed with `spawn Databricks kernel: No such file or directory`, while shell mode worked. Each call is a fresh process, so the model reloads the data every time.
+- **Tell the model what you pinned.** Early on, the model used pingouin's old column name `'cohen-d'` and hit a `KeyError` on 0.7's `cohen_d`. Once the tool description listed the versions, the next run was clean, at 30 seconds instead of 40.
 
-**Shell mode, with the image's own `python3`.** On a custom image I call `run_code` with `language: "sh"` and run Python myself. In my tests, the tool's stateful `language: "python"` mode returned an error on the plain Ubuntu image, while shell mode ran inside it without trouble. The trade-off is that each call is a fresh process with no state from earlier calls, so the tool description tells the model to reload the data in every script.
+## Step 6: Run it locally, then deploy
 
-**Tell the model what you pinned.** On my first recorded run, the model indexed pingouin's result with `'cohen-d'`, the column name from older releases. Pingouin 0.7 calls it `cohen_d`, so it hit a `KeyError`. It recovered on its own, but that cost a round trip. After I listed the exact versions in the tool description, the next run was clean and took 30 seconds instead of 40. That's a single before-and-after pair, but the failure mode is real: pinning the runtime is only half the job if the model is still writing code for a different one.
+`agentbricks dev` starts the agent with a chat UI on `localhost:8000`, picking up `AB_SANDBOX_ID` from `app.yaml`. I asked what a PM would ask: *"We ran a checkout-button test (new one-click button vs. current). Data: /Volumes/main/default/ab_data/checkout_button_test.csv. Did the treatment win, and should we ship it?"*
 
-A unit test, `tests/test_custom_sandbox.py`, locks in the guarantee. The model sees only `run_python(code, timeout_seconds)`, and every call goes out with `sandbox_id="ab-stats"` and `language="sh"`.
+The agent wrote two scripts and ran both in `ab-stats`. The first profiled the data. The second, below, ran the statistics:
 
-## Step 6: Try it locally
+![The run_python call: pingouin and statsmodels code the model wrote, followed by the sandbox's output](img/02-tool-call.png)
+*Local run: the second `run_python` call, with the model's code above and the sandbox's output below.*
 
-```bash
-agentbricks dev     # http://localhost:8000
-```
-
-`agentbricks dev` wraps `databricks apps run-local`, so local runs behave like the deployment. The bundled Workbench UI shows the binding as connected:
-
-![Workbench: the Tools panel shows the system.ai.sandbox binding as connected](img/01-workbench-tools.png)
-
-I asked the question a PM would: *"We ran a checkout-button test (new one-click button vs. current). Data: /Volumes/main/default/ab_data/checkout_button_test.csv. Did the treatment win, and should we ship it?"* The agent wrote two scripts, both sent to `ab-stats`. The first profiled the data. The second, below, ran the SRM check, the z-test with its confidence interval, and a Welch t-test with power:
-
-![The second run_python call: pingouin and statsmodels code the model wrote, followed by the sandbox's output](img/02-tool-call.png)
-
-## Step 7: Deploy
-
-```bash
-agentbricks -p my-ws deploy
-```
+Then I deployed it:
 
 ```console
+$ agentbricks -p my-ws deploy
 ✔ Deployed agent 'agent-bricks-ab-analyst'
-URL              https://agent-bricks-ab-analyst-<workspace-id>.aws.databricksapps.com
-Memory store     ab-analyst-…-memory
-Session store    ab-analyst-…-sessions
 Store access     granted to app service principal
 Deployed in 3m43s
 ```
 
-The first deploy took 3 minutes 43 seconds, and the one redeploy I timed took 57 seconds. One thing to watch before you commit: `deploy` writes the runtime settings it needs into your local `app.yaml`. After my deploy it held `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID`, `AGENT_MEMORY_STORE`, `AGENT_SESSION_STORE`, the package-index variables and several `DATABRICKS_AGENTBRICKS_RUNTIME_STORE_*` entries with workspace-specific values. The repo's `app.yaml` holds only `AB_SANDBOX_ID`. Review that diff and keep only your own settings in version control, since deploy adds the rest each time.
+The one redeploy I timed took 57 seconds. Because the tool uses `auth = "user"`, a user's first visit shows a consent screen, and after that, sandbox code reads data with their Unity Catalog permissions ([app authorization](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/auth)). `deploy` also writes its tracing, store and runtime settings into your local `app.yaml`. The repo's copy holds only `AB_SANDBOX_ID`, so review that diff before committing.
 
-The binding uses `auth = "user"`, so on first visit each user approves the app acting on their behalf. From then on, sandbox code runs with *their* Unity Catalog permissions, not the app's ([app authorization](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/auth)):
+Here's the hosted app while the agent is still streaming its answer. Pingouin's output from the sandbox is in the chat, and the Events panel logs the `run_python` call:
 
-![Consent screen listing the scopes the app requests for user authorization](img/06-user-auth-consent.png)
+![The deployed app while the agent is still answering: sandbox output in the chat, tool event in the Events panel](img/03-deployed-sandbox-output.png)
+*Deployed app, mid-answer: sandbox output in the chat, the tool call in the Events panel.*
 
-You can also call the deployed agent from a terminal. The quickest proof that it uses your image is to ask it:
+## Step 7: See every tool call in MLflow
 
-```bash
-agentbricks -p my-ws endpoint invoke agent-bricks-ab-analyst --path /api/invocations -o json --json '{
-  "id": "6f1c2a9e-3b7d-4c55-9a8e-2d4f6b1e0c37",
-  "session_id": "check-1",
-  "input": [{"role": "user", "content": "Print the OS, glibc, Python, pingouin and statsmodels versions, then count rows in /Volumes/main/default/ab_data/checkout_button_test.csv."}]
-}'
-```
+Tracing needs no extra code. `init` declared an MLflow experiment in `agent.toml`, and `deploy` wired the app to it, so every request becomes a [trace](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/overview). You can list them with `agentbricks tracing list`, or browse them in the experiment's Traces tab:
 
-(`"input": [...]` is the message-list shorthand. Use `{"messages": [...], "actor": ...}` when you need to control which memory partition a conversation uses.) The `run_python` result inside the JSON response, trimmed, came back in 21 seconds:
+![MLflow Traces tab: one row per request, with tokens and execution time](img/07-mlflow-traces-list.png)
+*Six deployed runs: the 15:33 version check, the 15:54 first analysis, the 15:56 sample-size question, and the three repeat analyses at 16:35. Local runs trace to a local MLflow server, so they don't appear here.*
 
-```text
-OS: Linux 6.18.60 Linux-6.18.60-x86_64-with-glibc2.39
-libc: ('glibc', '2.39')
-PRETTY_NAME="Ubuntu 24.04.5 LTS"
-Python: 3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]
-pingouin: 0.7.0
-statsmodels: 0.15.0
-lines incl header: 50001 data rows: 50000
-```
-
-Here is the hosted app while the agent was still streaming. The chat shows pingouin's output from the sandbox, and the Events panel records the `run_python` call with `"status": "success"`:
-
-![Deployed agent mid-run: sandbox output in the chat, tool event in the Events panel](img/03-deployed-sandbox-output.png)
-
-## Step 8: Read the trace in MLflow
-
-You get tracing without writing any code for it. `agentbricks init` declared an experiment in `agent.toml` (`[tracing] experiment_name = "/Shared/agentbricks_traces/…"`), and `deploy` wired the app to it, so every invocation lands there as an MLflow trace ([MLflow tracing](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/overview)). You can check from the terminal:
-
-```console
-$ agentbricks -p my-ws tracing list
-TRACE ID                              STATUS   LATENCY (MS)   CREATED
-tr-40845e5c569e2cfac2ecff8e2c5bd2bd   ● Ok     33015          28 minutes ago
-tr-94d793876eb3860011e68728b8beac60   ● Ok     20435          28 minutes ago
-…
-$ agentbricks -p my-ws tracing get tr-40845e5c569e2cfac2ecff8e2c5bd2bd
-Status         OK
-Latency (ms)   33015
-Spans          19
-```
-
-The experiment's **Traces** tab shows every run's request, token count, latency and status. The list includes the three identical-prompt runs I compare in the next section, plus a few other questions:
-
-![MLflow Traces tab: one row per agent invocation, with tokens and execution time](img/07-mlflow-traces-list.png)
-
-Open one and the span tree shows how the 33 seconds were spent. Select the second `run_python` span: its input is the script the model wrote, and its output is exactly what the sandbox printed, pingouin's `T_test` table with `p_val 0.032388`, `CI95 [0.02, 0.54]` and `power 0.571`. Each number in the PM's answer traces back to the code that produced it:
+Click a `run_python` span and you get the script the model wrote, followed by what the sandbox printed: `p_val 0.032388`, `CI95 [0.02, 0.54]` (the revenue-per-visitor difference, in dollars), `power 0.571`. These are the same values the agent quotes in its answer.
 
 ![Trace view: span tree on the left; the run_python span's code input and sandbox output on the right](img/08-mlflow-trace-run-python.png)
+*The second `tools` step is a memory `recall` (13.4 s). More on that below.*
 
-The wrapper from Step 5 is visible in the tree as well. Every `run_python` span (the tool the model sees) has a child `run_code` span (the managed `system.ai.sandbox` call). The child's inputs are the audit evidence that the code ran where you intended: `sandbox_id: ab-stats`, `language: sh`, the base64-shipped script and `timeout_seconds: 120`. None of those values came from the model:
+Each `run_python` contains a `run_code` span, which is the managed sandbox call the wrapper made. Its inputs show where the code ran: `sandbox_id: ab-stats` and `language: sh`, both set by the server.
 
 ![The nested run_code span: sandbox_id ab-stats and language sh, injected by the wrapper](img/09-mlflow-trace-run-code.png)
+*The `run_code` inputs the wrapper set: `sandbox_id: ab-stats`, `language: sh` and the base64-encoded script.*
 
-Reading the timeline turned up something I wouldn't have guessed:
+I expected the sandbox to be the slow part. The trace said otherwise. Some steps overlap, so the rows don't add up to the total:
 
 | Step | Time |
 |---|---|
-| 3 model calls (4.8K, 6.7K, 9.1K tokens) | 2.5 s + 4.7 s + 6.3 s |
-| Sandbox execution: profiling, then the statistics | 1.6 s, 2.3 s |
-| `recall` (long-term memory lookup) | **13.4 s** |
-| Whole run | 33.0 s, 20.6K tokens |
+| Two sandbox executions | 1.6 s + 2.3 s |
+| Three model calls (20.6K tokens in total) | 2.5 s + 4.7 s + 6.3 s |
+| Memory `recall` | 13.4 s |
+| Whole request | 33.0 s |
 
-**The sandbox wasn't the slow part.** The two executions in my custom image took under 4 seconds combined. The slowest step was the template's memory `recall` tool. The model called it alongside the first `run_python`, and because the graph waits for both before the next model call, it held up the run for about 12 seconds, a third of the total. For a stateless analyst like this one, I'd try removing the memory binding next. Either way, the trace is where that kind of finding comes from: you see the actual cost of every step instead of guessing.
+The model asked for `run_python` and the template's long-term memory `recall` at the same moment, 3.2 s into the run. The UI lists them as separate steps. `recall` took 13.4 s against `run_python`'s 1.6 s, and the next model call waited for it, so memory cost about 12 seconds, more than a third of the request. This analyst doesn't need memory, so dropping that binding is my next experiment.
 
-## What the agent concluded
+## What the numbers say
 
-The deployed agent's numbers match `scripts/reference_analysis.py`, which I ran separately in the same image (the README has the one-line `docker run`):
+I checked the agent's figures against `scripts/reference_analysis.py`, run separately in the same image. They matched:
 
 | Check | Result |
 |---|---|
 | Sample ratio (24,890 vs 25,110) | χ² p = 0.33, so no mismatch |
-| Conversion | 4.134% → 4.508%, +0.374 pp (95% CI +0.02 to +0.73), z-test p = 0.040 |
-| Revenue per visitor | $2.37 → $2.65, Welch's t-test p = 0.032, Cohen's d = 0.019 |
-| Achieved power, revenue test | ≈ 57% |
-| Achieved power, conversion test | ≈ 54% |
+| Conversion | 4.134% → 4.508%, +0.374 pp (95% CI +0.02 to +0.73), p = 0.040 |
+| Revenue per visitor | $2.37 → $2.65, Welch p = 0.032, Cohen's d = 0.019 |
+| Power at the observed effect | ≈ 54% for conversion, ≈ 57% for revenue |
 
-The numbers alone would have been easy to misread, and the caveats are what made the answer usable. The agent called both results significant at 0.05 but borderline, with confidence intervals that nearly touch zero. It pointed out that the test is underpowered, and that significant results from underpowered tests tend to overstate the effect. It noted that revenue is heavily skewed: most visitors spend $0 and the largest order is $345. It also flagged that it hadn't corrected for multiple comparisons, and said neither result would clear a Bonferroni threshold of 0.025 "comfortably". Strictly, neither clears it at all, since both p-values (0.040 and 0.032) are above 0.025. Its recommendation: the one-click button is low-risk, so shipping is reasonable, but for certainty, keep the test running until the sample roughly doubles.
+The caveats are the part I'd want a PM to read first. The agent called both results borderline, with confidence intervals that nearly touch zero. It warned that underpowered tests tend to overstate effects, and that revenue is heavily skewed. It also flagged that it hadn't corrected for testing two metrics: at a Bonferroni threshold of 0.025, neither p-value clears the bar.
 
-![The deployed agent's verdict](img/04-deployed-verdict.png)
+![The end of the first deployed run's answer: the caveats and the recommendation](img/04-deployed-verdict.png)
+*The end of the first deployed answer: caveats and recommendation. Its headline is quoted in the table below.*
 
-In a separate session I asked for an exact number. It computed about **46,400 visitors per arm** for 80% power on the conversion lift, about 21,300 more per arm than the test had. The reference script gets 46,385.
+Asked separately, it worked out that 80% power needs about 46,400 visitors per arm, against today's 25,000, if the true lift is as large as the one observed. The reference script gets 46,385. Both power figures are post-hoc: they say this test was small for an effect this size.
 
-![A separate run: the agent computes the sample size needed for 80% power](img/05-deployed-sample-size.png)
+Then I sent the same Step 6 prompt to the deployed agent three more times, in parallel. Across the five runs, the p-values never changed. The headlines did:
 
-One more experiment changed how I think about this. I sent the *identical* question to the deployed agent three more times. Every run came back with p = 0.040 and p = 0.032, but the headlines differed:
+| Run | Headline (verbatim excerpt) |
+|---|---|
+| Local | "…I'd keep the test running rather than call it a clear win." |
+| Deployed, first run | "…the evidence is thin. I'd ship it, or run it a bit longer if a false positive would be costly." |
+| Deployed, repeat 1 | "…the evidence is modest. I'd ship it, with some caution." |
+| Deployed, repeat 2 | "Lean ship, but it's borderline." |
+| Deployed, repeat 3 | "…the evidence is borderline. I'd ship it, or run it a bit longer if a false positive would be costly." |
 
-| Run | Time | Headline verdict |
-|---|---|---|
-| Local, recorded | 30 s | "I'd keep the test running rather than call it a clear win." |
-| Deployed #1 | 37 s | "I'd ship it, with some caution." |
-| Deployed #2 | 36 s | "Lean ship, but it's borderline." |
-| Deployed #3 | 23 s | "I'd ship it, or run it a bit longer if a false positive would be costly." |
+A pinned runtime makes the numbers reproducible. The model's judgment is sampled fresh on every run. If your team has a decision rule, such as "ship only if the lower CI bound is above zero and power is at least 80%", put it in the system prompt so the verdict follows the rule.
 
-The pinned runtime makes the **numbers** reproducible. It does nothing for the model's **judgment**, which is sampled fresh every time. If your team has a decision rule, such as "ship only if the lower CI bound clears X and power ≥ 80%", put it in the system prompt so the verdict follows the rule rather than varying from run to run.
+## Takeaways
 
----
+1. **Pin by digest.** The digest freezes the sandbox, but not the agent app around it.
+2. **Tell the model what you pinned.** Listing library versions in the tool description saved a failed round trip.
+3. **Pin the decision rule as well as the runtime.** Identical numbers gave one "keep running" and four ship-leaning verdicts, each with different conditions.
+4. **Check the trace before you tune anything.** Here the slow step was a 13.4 s memory lookup, not the 3.9 s of sandbox work.
 
-## Want your own front end?
+## Front end, team use, and the CLI roadmap
 
-The Workbench UI is a developer tool. For an internal product, build the UI with **[AppKit](https://developers.databricks.com/docs/appkit/v0/)**, Databricks' TypeScript and React SDK for Apps. There are two ways to wire it up:
+**A real front end.** The deployed app serves the same Workbench chat UI, which is fine for a pilot. For a product, build the UI with [AppKit](https://developers.databricks.com/docs/appkit/v0/), Databricks' TypeScript/React SDK for Apps. Either call this agent's `POST /api/invocations` endpoint, or move the agent into the app with the [Agents plugin](https://developers.databricks.com/docs/appkit/v0/plugins/agents) (beta). The docs explain [when to use which](https://developers.databricks.com/docs/apps/agentic-features).
 
-- **Keep this agent standalone** and call its HTTP API from your AppKit app: `POST /api/invocations`, with SSE streaming and a `session_id` per conversation. This fits when several apps or services share one agent.
-- **Move the agent into the app** with AppKit's **[Agents plugin](https://developers.databricks.com/docs/appkit/v0/plugins/agents)** (beta). It serves agents defined in your app at built-in chat routes and traces every tool call. The docs explain [when to choose it over a standalone Agent Bricks agent](https://developers.databricks.com/docs/apps/agentic-features).
+**Sharing it.** `run_code` only runs in sandboxes the caller owns, so with `auth = "user"`, treat this as a single-user pilot. For a team, create a sandbox per user from the same image, or re-add the tool with `--auth app` and let the app's service principal own one. Creating a sandbox from the image needs `USE CATALOG`, `USE SCHEMA` and `READ VOLUME` on the catalog and schema that hold it ([requirements](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image)). Keep credentials out of the image: a pushed digest never changes, and the registry [doesn't accept delete requests](https://docs.databricks.com/aws/en/artifact-registry/get-started).
 
-## Production notes
-
-- **Sandbox ownership.** `run_code` only runs in sandboxes the caller owns. With `auth = "user"`, the pinned sandbox works for the user who created it, which suits a personal tool or a pilot. For a shared app, either create one sandbox per user from the same image on first use, or re-add the tool with `agentbricks tools add sandbox --auth app`, let the app's service principal own the sandbox, and grant that principal access to the data.
-- **Pin by digest** in `image_uri`. Tags can move, but versions are immutable ([Artifact Registry](https://docs.databricks.com/aws/en/artifact-registry/)).
-- **Know what's pinned.** The digest freezes the *sandbox*, where the statistics run. The agent app's own Python dependencies resolve from the package index on each deploy, and the repo doesn't ship a `uv.lock`. Commit one generated against your own index if you need the app layer frozen too.
-- **Grants.** Anyone who creates a sandbox from the image needs `USE CATALOG`, `USE SCHEMA` and `READ VOLUME` on the image's schema ([custom images](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image)). The data needs its own grants.
-- **No secrets in the image.** Artifact versions are immutable and the registry doesn't support delete requests ([get started](https://docs.databricks.com/aws/en/artifact-registry/get-started)). A credential baked into a layer stays there. Use build secrets.
-- **Preview status.** Sandbox is Beta, Artifact Registry is Public Preview, and the Agent Bricks CLI is experimental. Pin your CLI version and re-check `--help` when you upgrade.
-
-## What's next
-
-There's an open **draft** PR in the public `databricks-ai-bridge` repo, [#828](https://github.com/databricks/databricks-ai-bridge/pull/828), that adds `agentbricks tools add sandbox --image-uri catalog.schema.image:tag`. It records the image in `agent.toml`, so the managed tool can create sandboxes from your image directly. If it lands, the pinning wrapper in this post gets simpler. The image itself, the amd64 rule and "tell the model what you pinned" all still apply.
+**A simpler binding.** A draft PR, [databricks-ai-bridge#828](https://github.com/databricks/databricks-ai-bridge/pull/828), adds `agentbricks tools add sandbox --image-uri …`. It would record the image in `agent.toml` and make the wrapper simpler. The image, the amd64 build and the version hints would stay the same.
 
 ## Cleanup
 
 ```bash
-agentbricks -p my-ws deployments delete agent-bricks-ab-analyst   # add -y in scripts
-databricks sandbox delete ab-stats --profile my-ws          # add --auto-approve in scripts
+agentbricks -p my-ws deployments delete agent-bricks-ab-analyst
+databricks sandbox delete ab-stats --profile my-ws
 databricks volumes delete main.default.ab_data --profile my-ws
 ```
 
-## Wrapping up
-
-The default sandbox is a fine general-purpose environment. Once an agent's answers depend on specific libraries, though, the runtime is part of the product, and it deserves the same treatment as code: built once, versioned, pinned and governed. With a custom image, one SDK call and a small wrapper around the managed tool, the agent gets exactly the libraries it needs, and the PM gets numbers they can rerun and audit. The best place to start is the amd64 build. Get that right and the rest is mostly configuration.
+The image stays in Artifact Registry, because the registry doesn't accept delete requests.
 
 ---
 
-## References
+If you build one of these, start with the Dockerfile and the `docker image inspect` check in Step 1. Then run `agentbricks tools add sandbox` and copy `agent/custom_sandbox.py` from the repo. The rest is one line in `agent.py`, a system prompt, and an `AB_SANDBOX_ID` entry in `app.yaml`.
 
-1. Agent Bricks CLI. Databricks docs. https://docs.databricks.com/aws/en/agents/custom-agents/agent-bricks-cli
-2. Agent Bricks CLI command reference. GitHub, `databricks/databricks-ai-bridge`. https://github.com/databricks/databricks-ai-bridge/blob/main/integrations/agentbricks/cli.md
-3. Databricks Sandbox overview. https://docs.databricks.com/aws/en/compute/serverless/sandbox
-4. Databricks Sandbox quickstart (agent tool, CLI and SDK). https://docs.databricks.com/aws/en/compute/serverless/sandbox-quickstart
-5. Create a sandbox from a custom image (requirements, troubleshooting, limitations). https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image
-6. Artifact Registry overview and limitations. https://docs.databricks.com/aws/en/artifact-registry/
-7. Get started with Artifact Registry (auth, grants, push, acceleration). https://docs.databricks.com/aws/en/artifact-registry/get-started
-8. Troubleshoot Artifact Registry. https://docs.databricks.com/aws/en/artifact-registry/troubleshooting
-9. Built-in MCP services (`system.ai.sandbox`). https://docs.databricks.com/aws/en/agents/mcp-tools/built-in-mcp-services
-10. Databricks Apps authorization (user authorization). https://docs.databricks.com/aws/en/dev-tools/databricks-apps/auth
-11. Unity Catalog volumes. https://docs.databricks.com/aws/en/volumes/
-12. Manage Databricks previews. https://docs.databricks.com/aws/en/admin/workspace-settings/manage-previews
-13. AppKit documentation. https://developers.databricks.com/docs/appkit/v0/
-14. AppKit Agents plugin. https://developers.databricks.com/docs/appkit/v0/plugins/agents
-15. Agentic features in Databricks Apps (Agents plugin vs. Agent Bricks CLI). https://developers.databricks.com/docs/apps/agentic-features
-16. databricks-ai-bridge PR #828, "Let sandbox tools select a Unity Catalog custom image" (draft). https://github.com/databricks/databricks-ai-bridge/pull/828
-17. MLflow Tracing on Databricks. https://docs.databricks.com/aws/en/mlflow3/genai/tracing/overview
-18. Docker: multi-platform builds. https://docs.docker.com/build/building/multi-platform/
-19. Docker: build attestations. https://docs.docker.com/build/metadata/attestations/
-20. Docker: build secrets. https://docs.docker.com/build/building/secrets/
-21. Ubuntu 24.04 (noble) glibc source package (2.39). https://launchpad.net/ubuntu/noble/+source/glibc
-22. Ubuntu 24.04 (noble) python3.12 source package (3.12.3). https://launchpad.net/ubuntu/noble/+source/python3.12
-23. statsmodels `proportions_ztest`. https://www.statsmodels.org/stable/generated/statsmodels.stats.proportion.proportions_ztest.html
-24. pingouin `ttest`. https://pingouin-stats.org/generated/pingouin.ttest.html
+## Key docs
+
+- [Create a sandbox from a custom image](https://docs.databricks.com/aws/en/compute/serverless/sandbox-custom-image): requirements, acceleration, limitations
+- [Artifact Registry](https://docs.databricks.com/aws/en/artifact-registry/): naming, auth, limitations
+- [Agent Bricks CLI](https://docs.databricks.com/aws/en/agents/custom-agents/agent-bricks-cli)
+- [Built-in MCP services](https://docs.databricks.com/aws/en/agents/mcp-tools/built-in-mcp-services): `system.ai.sandbox`
+- [MLflow Tracing](https://docs.databricks.com/aws/en/mlflow3/genai/tracing/overview)
+- [AppKit Agents plugin](https://developers.databricks.com/docs/appkit/v0/plugins/agents)

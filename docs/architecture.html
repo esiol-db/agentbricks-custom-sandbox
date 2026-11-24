@@ -7,14 +7,14 @@ flowchart TB
   classDef run fill:#E6F4EA,stroke:#188038,color:#202124
   classDef user fill:#F1F3F4,stroke:#5F6368,color:#202124
 
-  subgraph B["① Build once, on a laptop or in CI"]
+  subgraph B["① Build once, on your laptop"]
     direction LR
     D["Dockerfile<br/>ubuntu:24.04 · glibc 2.39 · Python 3.12<br/>scipy · statsmodels · pingouin · duckdb"]:::build
     X["docker buildx build<br/>--platform linux/amd64<br/>--provenance=false --sbom=false"]:::build
     D --> X
   end
 
-  subgraph UC["② Unity Catalog"]
+  subgraph UC["② Store in Unity Catalog"]
     direction LR
     AR[("Artifact Registry<br/>main.default.ab-stats-sandbox:v1")]:::uc
     V[("Volume<br/>/Volumes/main/default/ab_data")]:::uc
@@ -26,7 +26,7 @@ flowchart TB
     APP["Databricks App<br/><b>agent-bricks-ab-analyst</b><br/>LangGraph + run_python wrapper"]:::run
     MCP["system.ai.sandbox MCP<br/>run_code(sandbox_id=ab-stats,<br/>language=sh)"]:::run
     SB["Sandbox <b>ab-stats</b><br/>(from image@sha256)"]:::run
-    LLM["AI Gateway<br/>claude-sonnet-5-5"]:::run
+    LLM["AI Gateway<br/>system.ai.claude-sonnet-5-5"]:::run
     U -- "Did the treatment win?" --> APP
     APP <--> LLM
     APP -- "run_python(code)" --> MCP
